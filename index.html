@@ -7,27 +7,36 @@
         body { background: #111; color: #fff; font-family: sans-serif; text-align: center; padding: 20px; margin: 0; }
         .hidden { display: none !important; }
         .box { border: 2px solid #28a745; padding: 30px; margin: 50px auto; max-width: 500px; background: #1a1a1a; border-radius: 8px; }
+        .login-box { border: 2px solid #0078d7; padding: 30px; margin: 100px auto; max-width: 400px; background: #1a1a1a; border-radius: 8px; }
+        input[type="password"] { width: 80%; padding: 10px; margin: 15px 0; background: #222; border: 1px solid #444; color: #fff; font-size: 16px; border-radius: 4px; text-align: center; }
         .control-bar { margin-bottom: 15px; }
         button { background: #0078d7; color: white; border: none; padding: 10px 20px; font-size: 14px; cursor: pointer; border-radius: 4px; margin: 5px; }
         button.active { background: #ffc107; color: black; font-weight: bold; }
         button.start-btn { background: #28a745; padding: 12px 24px; font-size: 16px; font-weight: bold; }
         video { width: 100%; max-width: 90vw; max-height: 75vh; background: #000; border: 2px solid #0078d7; border-radius: 6px; }
-        .error-screen { color: #dc3545; font-size: 24px; margin-top: 100px; font-weight: bold; }
+        .error-msg { color: #dc3545; margin-top: 10px; font-size: 14px; font-weight: bold; }
     </style>
 </head>
 <body>
 
-    <!-- SICHERHEITS-PROTEKTION -->
-    <div id="auth-error" class="error-screen hidden">❌ ACCESS DENIED: Invalid or Missing Security Token</div>
+    <!-- LOGIN SCREEN -->
+    <div id="login-view" class="login-box">
+        <h2>🧠 NERON DECK</h2>
+        <p>Enter security password to access the system:</p>
+        <input type="password" id="password-input" placeholder="••••••••" onkeypress="checkEnter(event)">
+        <br>
+        <button onclick="validatePassword()">Unlock Deck</button>
+        <div id="login-error" class="error-msg hidden">❌ Invalid Password! Access Denied.</div>
+    </div>
 
-    <!-- SENDER-BEREICH (Zuhause) -->
+    <!-- SENDER SCREEN (Zuhause PC) -->
     <div id="sender-view" class="box hidden">
         <h2>🖥️ NERON DECK: Live Sender (PC)</h2>
         <p>This window encodes your monitor and starts the hardware-accelerated WebRTC network stream.</p>
         <button class="start-btn" onclick="startStreaming()">Start Stream</button>
     </div>
 
-    <!-- EMPFÄNGER-BEREICH (Schule) -->
+    <!-- RECEIVER SCREEN (Schulgerät) -->
     <div id="receiver-view" class="hidden">
         <div class="control-bar">
             <button id="btn-lc" class="active" onclick="switchRes(2560, 1440, 'btn-lc')">LC-Power (1440p)</button>
@@ -37,29 +46,39 @@
     </div>
 
     <script>
-    // DEIN SICHERHEITS-PASSWORT
-    const SECRET_PASSWORD = "neron_secret_1337";
+    // PASSTWORT CONFIGURATION
+    const SECRET_PASSWORD = "@310513LoL";
 
-    // ABSOLUTE SECURITY CHECK
-    const currentHash = window.location.hash.substring(1);
-    if (currentHash !== SECRET_PASSWORD) {
-        document.getElementById('auth-error').classList.remove('hidden');
-        throw new Error("Authentication failed");
-    }
-
-    // SYSTEM MODE SELECTOR
+    // SYSTEM MODE INITIALIZATION
     const isSender = window.location.search.includes('mode=sender');
-    if (isSender) {
-        document.getElementById('sender-view').classList.remove('hidden');
-    } else {
-        document.getElementById('receiver-view').classList.remove('hidden');
-    }
-
-    // MONITOR AUFLÖSUNG
     const videoElement = document.getElementById('remoteVideo');
     let pcWidth = 2560;
     let pcHeight = 1440;
 
+    // LOGIN LOGIC
+    function checkEnter(event) {
+        if (event.key === "Enter") {
+            validatePassword();
+        }
+    }
+
+    function validatePassword() {
+        const input = document.getElementById('password-input').value;
+        if (input === SECRET_PASSWORD) {
+            document.getElementById('login-view').classList.add('hidden');
+            if (isSender) {
+                document.getElementById('sender-view').classList.remove('hidden');
+            } else {
+                document.getElementById('receiver-view').classList.remove('hidden');
+            }
+        } else {
+            const errorDiv = document.getElementById('login-error');
+            errorDiv.classList.remove('hidden');
+            document.getElementById('password-input').value = "";
+        }
+    }
+
+    // RESOLUTION TOGGLE
     function switchRes(w, h, btnId) {
         document.getElementById('btn-lc').classList.remove('active');
         document.getElementById('btn-hp').classList.remove('active');
@@ -68,7 +87,7 @@
         pcHeight = h;
     }
 
-    // WEBRTC CONNECTION HANDLING
+    // WEBRTC STRUCTURING
     let peerConnection = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:://google.com' }]
     });
@@ -81,7 +100,7 @@
         }
     };
 
-    // SENDER PIPELINE
+    // VIDEO CAPTURING
     async function startStreaming() {
         try {
             const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -97,9 +116,9 @@
         }
     }
 
-    // RECEIVER PIPELINE
+    // STREAM RECEIVING
     peerConnection.ontrack = event => {
-        videoElement.srcObject = event.streams[0];
+        videoElement.srcObject = event.streams;
     };
 
     bc.onmessage = async (event) => {
@@ -119,7 +138,7 @@
         }
     };
 
-    // MOUSE CLICKS
+    // MOUSE ACTION COORDINATES
     videoElement.addEventListener('click', function(event) {
         const rect = videoElement.getBoundingClientRect();
         const clickX = event.clientX - rect.left;
