@@ -19,6 +19,7 @@ button:disabled { opacity:0.3; cursor:not-allowed; }
 input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:10px; font-size:22px; text-align:center; width:160px; letter-spacing:8px; border-radius:4px; font-family:'Courier New',monospace; outline:none; }
 #video { width:90%; max-width:1000px; border:2px solid #00ffcc44; border-radius:8px; background:#000; margin:15px auto; display:block; aspect-ratio:16/9; }
 .status { color:#888; font-size:12px; margin-top:10px; }
+.warn { color:#ff4444; font-size:14px; margin-top:10px; font-weight:bold; }
 .log { text-align:left; font-size:11px; color:#666; max-height:150px; overflow-y:auto; margin:20px auto; max-width:800px; background:#0d1117; padding:10px; border-radius:6px; border:1px solid #00ffcc22; }
 </style>
 </head>
@@ -35,6 +36,7 @@ input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:10px; 
 <h2>&#9664; RECEIVER &mdash; CODE EINGEBEN</h2>
 <input type="text" id="joinCode" maxlength="6" placeholder="000000" inputmode="numeric">
 <button id="joinBtn">VERBINDEN</button>
+<div class="warn" id="warnBox"></div>
 
 <video id="video" autoplay playsinline muted></video>
 <div class="status" id="status">Bereit</div>
@@ -43,6 +45,7 @@ input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:10px; 
 <script>
 var videoEl = document.getElementById('video');
 var statusEl = document.getElementById('status');
+var warnEl = document.getElementById('warnBox');
 var logEl = document.getElementById('log');
 var myCodeEl = document.getElementById('myCode');
 var joinCodeEl = document.getElementById('joinCode');
@@ -60,17 +63,11 @@ var isSender = false;
 
 var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 
-// Prüfen, was das Gerät kann
 var canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 var canCam = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 
-// Buttons ausblenden, wenn nicht unterstützt
-if (!canScreen) {
-  screenBtn.style.display = 'none';
-}
-if (!canCam) {
-  camBtn.style.display = 'none';
-}
+if (!canScreen) screenBtn.style.display = 'none';
+if (!canCam) camBtn.style.display = 'none';
 
 function log(msg) {
   logEl.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg + '\\n' + logEl.textContent;
@@ -88,6 +85,7 @@ function connect(code, asSender) {
   ws = new WebSocket(WS_URL);
   ws.binaryType = 'arraybuffer';
   isSender = asSender;
+  warnEl.textContent = '';
 
   ws.onopen = function() {
     log('Verbunden, Raum ' + code);
@@ -96,6 +94,24 @@ function connect(code, asSender) {
   };
 
   ws.onmessage = function(event) {
+    // Text-Nachricht vom Server (Statusmeldung)
+    if (typeof event.data === 'string') {
+      if (event.data === 'ROOM_EMPTY') {
+        warnEl.textContent = '&#9888; Kein Sender in diesem Raum!';
+        log('Raum leer - kein Sender aktiv');
+      }
+      if (event.data === 'SENDER_JOINED') {
+        warnEl.textContent = '';
+        log('Sender ist dem Raum beigetreten');
+      }
+      if (event.data === 'SENDER_LEFT') {
+        warnEl.textContent = '&#9888; Sender hat den Raum verlassen!';
+        log('Sender hat den Raum verlassen');
+      }
+      return;
+    }
+
+    // Binärdaten (Video-Chunks)
     if (event.data instanceof ArrayBuffer && !isSender) {
       if (sourceBuffer && !sourceBuffer.updating) {
         try { sourceBuffer.appendBuffer(event.data); }
@@ -191,12 +207,22 @@ myCodeEl.textContent = myCode;
 
 screenBtn.addEventListener('click', function() {
   connect(myCode, true);
-  setTimeout(function() { startStream('screen'); }, 300);
+  var waitOpen = setInterval(function() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      clearInterval(waitOpen);
+      startStream('screen');
+    }
+  }, 100);
 });
 
 camBtn.addEventListener('click', function() {
   connect(myCode, true);
-  setTimeout(function() { startStream('cam'); }, 300);
+  var waitOpen = setInterval(function() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      clearInterval(waitOpen);
+      startStream('cam');
+    }
+  }, 100);
 });
 
 stopBtn.addEventListener('click', stopStream);
@@ -208,16 +234,8 @@ joinBtn.addEventListener('click', function() {
   connect(code, false);
 });
 
-// Fehler abfangen, damit Konsole ruhig bleibt
-window.addEventListener('error', function(e) {
-  if (e.message && e.message.indexOf('getDisplayMedia') === -1) {
-    log('Fehler: ' + e.message);
-  }
-  e.preventDefault();
-});
-window.addEventListener('unhandledrejection', function(e) {
-  e.preventDefault();
-});
+window.addEventListener('error', function(e) { e.preventDefault(); });
+window.addEventListener('unhandledrejection', function(e) { e.preventDefault(); });
 </script>
 </body>
 </html>`;
@@ -228,38 +246,91 @@ const server = http.createServer(function(req, res) {
 });
 
 const wss = new WebSocket.Server({ server });
+
+// Raum-Struktur: code -> { senders: Set, receivers: Set }
 const rooms = new Map();
+
+function getRoom(code) {
+  if (!rooms.has(code)) {
+    rooms.set(code, { senders: new Set(), receivers: new Set() });
+  }
+  return rooms.get(code);
+}
 
 wss.on('connection', function(ws) {
   let roomCode = null;
-  let clientId = null;
+  let role = null;
 
   ws.on('message', function(data) {
     const text = data.toString();
 
+    // JOIN:<code>:<role>
     if (text.startsWith('JOIN:')) {
       const parts = text.split(':');
       roomCode = parts[1];
-      clientId = parts[2];
-      if (!rooms.has(roomCode)) rooms.set(roomCode, new Set());
-      rooms.get(roomCode).add(ws);
-      console.log('Client ' + clientId + ' joined room ' + roomCode);
+      role = parts[2];
+
+      const room = getRoom(roomCode);
+
+      if (role === 'sender') {
+        room.senders.add(ws);
+        console.log('Sender joined room ' + roomCode);
+        // Empfänger benachrichtigen, dass Sender da ist
+        for (const r of room.receivers) {
+          if (r.readyState === WebSocket.OPEN) r.send('SENDER_JOINED');
+        }
+      } else {
+        room.receivers.add(ws);
+        console.log('Receiver joined room ' + roomCode);
+        // Prüfen, ob ein Sender da ist
+        if (room.senders.size === 0) {
+          ws.send('ROOM_EMPTY');
+        } else {
+          ws.send('SENDER_JOINED');
+        }
+      }
       return;
     }
 
-    if (roomCode && rooms.has(roomCode)) {
-      for (const client of rooms.get(roomCode)) {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(data);
+    // Binärdaten weiterleiten
+    if (roomCode) {
+      const room = rooms.get(roomCode);
+      if (!room) return;
+
+      if (role === 'sender') {
+        // Sender -> alle Empfänger
+        for (const r of room.receivers) {
+          if (r !== ws && r.readyState === WebSocket.OPEN) {
+            r.send(data);
+          }
+        }
+      } else {
+        // Empfänger -> alle Sender (normalerweise nicht nötig)
+        for (const s of room.senders) {
+          if (s !== ws && s.readyState === WebSocket.OPEN) {
+            s.send(data);
+          }
         }
       }
     }
   });
 
   ws.on('close', function() {
-    if (roomCode && rooms.has(roomCode)) {
-      rooms.get(roomCode).delete(ws);
-      if (rooms.get(roomCode).size === 0) rooms.delete(roomCode);
+    if (!roomCode) return;
+    const room = rooms.get(roomCode);
+    if (!room) return;
+
+    if (role === 'sender') {
+      room.senders.delete(ws);
+      for (const r of room.receivers) {
+        if (r.readyState === WebSocket.OPEN) r.send('SENDER_LEFT');
+      }
+    } else {
+      room.receivers.delete(ws);
+    }
+
+    if (room.senders.size === 0 && room.receivers.size === 0) {
+      rooms.delete(roomCode);
     }
   });
 });
