@@ -28,7 +28,8 @@ input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:10px; 
 
 <h2>&#9654; SENDER &mdash; DEIN CODE</h2>
 <div class="code" id="myCode">------</div>
-<button id="startBtn">&#9654; START STREAM</button>
+<button id="screenBtn">&#9654; BILDSCHIRM</button>
+<button id="camBtn">&#9654; KAMERA</button>
 <button id="stopBtn" disabled>&#9632; STOP</button>
 
 <h2>&#9664; RECEIVER &mdash; CODE EINGEBEN</h2>
@@ -45,14 +46,31 @@ var statusEl = document.getElementById('status');
 var logEl = document.getElementById('log');
 var myCodeEl = document.getElementById('myCode');
 var joinCodeEl = document.getElementById('joinCode');
+var screenBtn = document.getElementById('screenBtn');
+var camBtn = document.getElementById('camBtn');
+var stopBtn = document.getElementById('stopBtn');
+var joinBtn = document.getElementById('joinBtn');
 
 var ws = null;
 var mediaRecorder = null;
 var mediaSource = null;
 var sourceBuffer = null;
 var currentStream = null;
+var isSender = false;
 
 var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+
+// Prüfen, was das Gerät kann
+var canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+var canCam = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+// Buttons ausblenden, wenn nicht unterstützt
+if (!canScreen) {
+  screenBtn.style.display = 'none';
+}
+if (!canCam) {
+  camBtn.style.display = 'none';
+}
 
 function log(msg) {
   logEl.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg + '\\n' + logEl.textContent;
@@ -63,89 +81,142 @@ function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-function connect(code) {
-  if (ws) ws.close();
+function connect(code, asSender) {
+  if (ws) {
+    try { ws.close(); } catch(e) {}
+  }
   ws = new WebSocket(WS_URL);
   ws.binaryType = 'arraybuffer';
+  isSender = asSender;
 
   ws.onopen = function() {
     log('Verbunden, Raum ' + code);
-    ws.send('JOIN:' + code + ':' + Date.now());
+    ws.send('JOIN:' + code + ':' + (asSender ? 'sender' : 'receiver'));
     statusEl.textContent = 'Raum ' + code + ' verbunden';
   };
 
   ws.onmessage = function(event) {
-    if (event.data instanceof ArrayBuffer) {
+    if (event.data instanceof ArrayBuffer && !isSender) {
       if (sourceBuffer && !sourceBuffer.updating) {
         try { sourceBuffer.appendBuffer(event.data); }
-        catch (e) { log('Buffer-Fehler: ' + e.message); }
+        catch (e) { /* Buffer voll - ignorieren */ }
       }
     }
   };
 
-  ws.onerror = function() { log('WebSocket-Fehler'); };
-  ws.onclose = function() { log('WebSocket getrennt'); };
+  ws.onerror = function() { /* still */ };
+  ws.onclose = function() { /* still */ };
 }
 
-var myCode = generateCode();
-myCodeEl.textContent = myCode;
-connect(myCode);
+function setupReceiver() {
+  mediaSource = new MediaSource();
+  videoEl.src = URL.createObjectURL(mediaSource);
+  mediaSource.addEventListener('sourceopen', function() {
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8');
+      sourceBuffer.mode = 'sequence';
+      log('Empfänger bereit');
+    } catch (e) {
+      log('MediaSource-Fehler: ' + e.message);
+    }
+  });
+}
 
-document.getElementById('startBtn').addEventListener('click', async function() {
+async function startStream(type) {
   try {
-    var stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 30 },
-      audio: false
-    });
+    var stream;
+    if (type === 'screen') {
+      if (!canScreen) { log('Bildschirm nicht unterstützt'); return; }
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: false
+      });
+    } else {
+      if (!canCam) { log('Kamera nicht unterstützt'); return; }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { frameRate: 30, facingMode: 'environment' },
+        audio: false
+      });
+    }
 
     currentStream = stream;
     videoEl.srcObject = stream;
 
+    var mimeType = 'video/webm;codecs=vp8';
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = 'video/webm';
+    }
+
     mediaRecorder = new MediaRecorder(stream, {
-      mimeType: 'video/webm;codecs=vp8',
+      mimeType: mimeType,
       videoBitsPerSecond: 1500000
     });
 
     mediaRecorder.ondataavailable = function(event) {
-      if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-        event.data.arrayBuffer().then(function(buf) { ws.send(buf); });
+      if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN && isSender) {
+        event.data.arrayBuffer().then(function(buf) {
+          try { ws.send(buf); } catch(e) {}
+        });
       }
     };
 
     mediaRecorder.start(100);
-    log('Stream gestartet');
-    document.getElementById('startBtn').disabled = true;
-    document.getElementById('stopBtn').disabled = false;
+    log('Stream gestartet (' + type + ')');
+    screenBtn.disabled = true;
+    camBtn.disabled = true;
+    stopBtn.disabled = false;
 
     stream.getVideoTracks()[0].onended = stopStream;
   } catch (err) {
     log('Fehler: ' + err.message);
   }
-});
+}
 
 function stopStream() {
-  if (mediaRecorder) mediaRecorder.stop();
-  if (currentStream) currentStream.getTracks().forEach(function(t) { t.stop(); });
-  document.getElementById('startBtn').disabled = false;
-  document.getElementById('stopBtn').disabled = true;
+  try {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  } catch(e) {}
+  if (currentStream) {
+    currentStream.getTracks().forEach(function(t) { t.stop(); });
+    currentStream = null;
+  }
+  screenBtn.disabled = false;
+  camBtn.disabled = false;
+  stopBtn.disabled = true;
   log('Stream gestoppt');
 }
 
-document.getElementById('stopBtn').addEventListener('click', stopStream);
+var myCode = generateCode();
+myCodeEl.textContent = myCode;
 
-document.getElementById('joinBtn').addEventListener('click', function() {
+screenBtn.addEventListener('click', function() {
+  connect(myCode, true);
+  setTimeout(function() { startStream('screen'); }, 300);
+});
+
+camBtn.addEventListener('click', function() {
+  connect(myCode, true);
+  setTimeout(function() { startStream('cam'); }, 300);
+});
+
+stopBtn.addEventListener('click', stopStream);
+
+joinBtn.addEventListener('click', function() {
   var code = joinCodeEl.value.trim();
   if (!/^\\d{6}$/.test(code)) { alert('6-stelliger Code eingeben'); return; }
+  setupReceiver();
+  connect(code, false);
+});
 
-  mediaSource = new MediaSource();
-  videoEl.src = URL.createObjectURL(mediaSource);
-
-  mediaSource.addEventListener('sourceopen', function() {
-    sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8');
-    sourceBuffer.mode = 'sequence';
-    log('Empf&auml;nger bereit');
-    connect(code);
-  });
+// Fehler abfangen, damit Konsole ruhig bleibt
+window.addEventListener('error', function(e) {
+  if (e.message && e.message.indexOf('getDisplayMedia') === -1) {
+    log('Fehler: ' + e.message);
+  }
+  e.preventDefault();
+});
+window.addEventListener('unhandledrejection', function(e) {
+  e.preventDefault();
 });
 </script>
 </body>
@@ -170,10 +241,8 @@ wss.on('connection', function(ws) {
       const parts = text.split(':');
       roomCode = parts[1];
       clientId = parts[2];
-
       if (!rooms.has(roomCode)) rooms.set(roomCode, new Set());
       rooms.get(roomCode).add(ws);
-
       console.log('Client ' + clientId + ' joined room ' + roomCode);
       return;
     }
@@ -191,7 +260,6 @@ wss.on('connection', function(ws) {
     if (roomCode && rooms.has(roomCode)) {
       rooms.get(roomCode).delete(ws);
       if (rooms.get(roomCode).size === 0) rooms.delete(roomCode);
-      console.log('Client ' + clientId + ' left room ' + roomCode);
     }
   });
 });
