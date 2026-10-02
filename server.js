@@ -111,8 +111,19 @@ function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function sendReceiverReady() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('RECEIVER_READY');
+    log('RECEIVER_READY gesendet', 'ok');
+  } else {
+    log('Warte auf WebSocket, um RECEIVER_READY zu senden...', 'warn');
+    setTimeout(sendReceiverReady, 200);
+  }
+}
+
 function connect(code, asSender) {
   if (ws) { try { ws.close(); } catch(e) {} }
+
   ws = new WebSocket(WS_URL);
   ws.binaryType = 'arraybuffer';
   isSender = asSender;
@@ -125,6 +136,10 @@ function connect(code, asSender) {
     log('WebSocket OFFEN', 'ok');
     ws.send('JOIN:' + code + ':' + (asSender ? 'sender' : 'receiver'));
     statusEl.textContent = 'Raum ' + code + ' verbunden';
+
+    if (!asSender && sourceBuffer) {
+      sendReceiverReady();
+    }
   };
 
   ws.onmessage = function(event) {
@@ -164,7 +179,6 @@ function connect(code, asSender) {
 
       if (sourceBuffer) {
         if (sourceBuffer.updating) {
-          // Buffer beschäftigt - warten, nicht verwerfen
           var waitForBuffer = setInterval(function() {
             if (!sourceBuffer.updating) {
               clearInterval(waitForBuffer);
@@ -195,14 +209,11 @@ function setupReceiver() {
   mediaSource.addEventListener('sourceopen', function() {
     log('MediaSource OFFEN', 'ok');
     try {
-      sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8');
+      sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8,opus');
       sourceBuffer.mode = 'sequence';
       log('SourceBuffer bereit', 'ok');
 
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send('RECEIVER_READY');
-        log('RECEIVER_READY gesendet', 'ok');
-      }
+      sendReceiverReady();
     } catch (e) {
       log('addSourceBuffer: ' + erklärFehler(e), 'error');
     }
@@ -216,11 +227,13 @@ async function startStream(type) {
 
     if (type === 'screen') {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 }, audio: false
+        video: { frameRate: 30 },
+        audio: true
       });
     } else {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { frameRate: 30, facingMode: 'environment' }, audio: false
+        video: { frameRate: 30, facingMode: 'environment' },
+        audio: true
       });
     }
 
@@ -228,12 +241,16 @@ async function startStream(type) {
     currentStream = stream;
     videoEl.srcObject = stream;
 
-    var mimeType = 'video/webm;codecs=vp8';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
+    var mimeType = 'video/webm;codecs=vp8,opus';
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = 'video/webm';
+      log('vp8/opus nicht unterstützt, nutze video/webm', 'warn');
+    }
 
     mediaRecorder = new MediaRecorder(stream, {
       mimeType: mimeType,
-      videoBitsPerSecond: 1500000
+      videoBitsPerSecond: 1500000,
+      audioBitsPerSecond: 64000
     });
 
     mediaRecorder.ondataavailable = function(event) {
