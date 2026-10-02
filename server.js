@@ -68,14 +68,14 @@ var chunkCount = 0;
 var bytesReceived = 0;
 var pendingStreamType = null;
 var receiverReady = false;
+var firstRealChunkReceived = false;
 
-// ============================================================
-// LATENZ-OPTIMIERUNGEN
-// ============================================================
-var CHUNK_INTERVAL_MS = 30;        // statt 100ms -> 30ms (kleinere Chunks, schnellere Übertragung)
-var VIDEO_BITRATE = 800000;        // statt 1500000 -> 800k (weniger Daten)
-var AUDIO_BITRATE = 48000;         // statt 64000 -> 48k
-var MAX_BUFFER_AHEAD = 1.0;        // Sekunden - wenn Buffer mehr als 1s voraus ist, aufholen
+// Latenz-Optimierungen
+var CHUNK_INTERVAL_MS = 30;
+var VIDEO_BITRATE = 800000;
+var AUDIO_BITRATE = 48000;
+var MAX_BUFFER_AHEAD = 1.0;
+var MIN_CHUNK_SIZE = 100; // Chunks unter 100 Bytes ignorieren
 
 var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 
@@ -129,6 +129,9 @@ function sendReceiverReady() {
 }
 
 function appendChunk(data) {
+  if (!data || data.byteLength < MIN_CHUNK_SIZE) {
+    return; // Zu klein, kein echter Video-Chunk
+  }
   if (!sourceBuffer || !mediaSource) return;
   if (mediaSource.readyState !== 'open') return;
   if (sourceBuffer.updating) {
@@ -138,13 +141,16 @@ function appendChunk(data) {
   try {
     sourceBuffer.appendBuffer(data);
 
-    // Latenz-Optimierung: Wenn Buffer zu weit voraus ist, aufholen
+    if (!firstRealChunkReceived) {
+      firstRealChunkReceived = true;
+      log('Erster ECHTER Chunk verarbeitet (' + data.byteLength + ' bytes)', 'ok');
+    }
+
+    // Latenz-Optimierung: Buffer aufholen
     if (videoEl.buffered.length > 0) {
       var bufferedEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
-      var currentTime = videoEl.currentTime;
-      var bufferAhead = bufferedEnd - currentTime;
+      var bufferAhead = bufferedEnd - videoEl.currentTime;
       if (bufferAhead > MAX_BUFFER_AHEAD) {
-        // Springe nach vorne, um Latenz abzubauen
         videoEl.currentTime = bufferedEnd - 0.3;
       }
     }
@@ -163,6 +169,7 @@ function connect(code, asSender) {
   chunkCount = 0;
   bytesReceived = 0;
   receiverReady = false;
+  firstRealChunkReceived = false;
 
   ws.onopen = function() {
     log('WebSocket OFFEN', 'ok');
@@ -196,8 +203,9 @@ function connect(code, asSender) {
       chunkCount++;
       bytesReceived += event.data.byteLength;
 
-      if (chunkCount === 1) log('Erster Chunk empfangen (' + event.data.byteLength + ' bytes)', 'ok');
-      else if (chunkCount % 50 === 0) log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
+      if (chunkCount % 50 === 0) {
+        log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
+      }
 
       appendChunk(event.data);
     }
@@ -215,7 +223,6 @@ function setupReceiver() {
   mediaSource.addEventListener('sourceopen', function() {
     log('MediaSource OFFEN', 'ok');
     try {
-      // Codec-Priorität: H.264 zuerst (hardwarebeschleunigt, latenzärmer)
       var codecs = [
         'video/webm;codecs=h264,opus',
         'video/webm;codecs=vp9,opus',
@@ -275,7 +282,6 @@ async function startStream(type) {
     currentStream = stream;
     videoEl.srcObject = stream;
 
-    // Codec-Priorität auch beim Sender
     var mimeType = 'video/webm;codecs=vp8,opus';
     var candidates = ['video/webm;codecs=h264,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
     for (var i = 0; i < candidates.length; i++) {
@@ -294,6 +300,9 @@ async function startStream(type) {
 
     mediaRecorder.ondataavailable = function(event) {
       if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN && isSender) {
+        // WICHTIG: Leere/kleine Chunks nicht senden
+        if (event.data.size < MIN_CHUNK_SIZE) return;
+        
         chunkCount++;
         event.data.arrayBuffer().then(function(buf) {
           try {
@@ -306,7 +315,6 @@ async function startStream(type) {
       }
     };
 
-    // Latenz-Optimierung: 30ms Chunks statt 100ms
     mediaRecorder.start(CHUNK_INTERVAL_MS);
     log('Stream gestartet (' + type + ') - Chunks alle ' + CHUNK_INTERVAL_MS + 'ms', 'ok');
     screenBtn.disabled = true;
@@ -337,7 +345,7 @@ var myCode = generateCode();
 myCodeEl.textContent = myCode;
 log('Seite geladen. Code: ' + myCode);
 log('Bildschirm: ' + canScreen + ' | Kamera: ' + canCam);
-log('Chunk-Intervall: ' + CHUNK_INTERVAL_MS + 'ms | Video: ' + (VIDEO_BITRATE/1000) + 'kbps');
+log('Chunk: ' + CHUNK_INTERVAL_MS + 'ms | Video: ' + (VIDEO_BITRATE/1000) + 'kbps | Min-Chunk: ' + MIN_CHUNK_SIZE + ' Bytes');
 
 screenBtn.addEventListener('click', function() {
   connect(myCode, true);
