@@ -29,7 +29,7 @@ input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:8px; f
 </head>
 <body>
 <h1>NERON DECK</h1>
-<p style="color:#00ffcc66;font-size:10px;">WebSocket Stream Relay</p>
+<p style="color:#00ffcc66;font-size:10px;">Low-Latency Mode</p>
 
 <h2>&#9654; SENDER</h2>
 <div class="code" id="myCode">------</div>
@@ -69,6 +69,14 @@ var bytesReceived = 0;
 var pendingStreamType = null;
 var receiverReady = false;
 
+// ============================================================
+// LATENZ-OPTIMIERUNGEN
+// ============================================================
+var CHUNK_INTERVAL_MS = 30;        // statt 100ms -> 30ms (kleinere Chunks, schnellere Übertragung)
+var VIDEO_BITRATE = 800000;        // statt 1500000 -> 800k (weniger Daten)
+var AUDIO_BITRATE = 48000;         // statt 64000 -> 48k
+var MAX_BUFFER_AHEAD = 1.0;        // Sekunden - wenn Buffer mehr als 1s voraus ist, aufholen
+
 var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 
 var canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
@@ -84,11 +92,11 @@ function erklärFehler(err) {
   if (err.name === 'NotReadableError') return 'Gerät blockiert (andere App).';
   if (err.name === 'NotSupportedError') return 'Nicht unterstützt.';
   if (err.name === 'QuotaExceededError') return 'Buffer voll.';
+  if (err.name === 'InvalidStateError') return 'Buffer wurde entfernt.';
   if (err.code === 1000) return 'Verbindung normal geschlossen.';
   if (err.code === 1001) return 'Verbindung geschlossen (Tab zu).';
-  if (err.code === 1006) return 'Verbindung unerwartet abgebrochen (Render schläft / Internet weg).';
+  if (err.code === 1006) return 'Verbindung unerwartet abgebrochen.';
   if (err.code === 1011) return 'Server-Fehler.';
-  if (err.message && err.message.includes('Failed to fetch')) return 'Netzwerk nicht erreichbar.';
   return (err.name || 'Error') + ': ' + (err.message || String(err));
 }
 
@@ -116,8 +124,32 @@ function sendReceiverReady() {
     ws.send('RECEIVER_READY');
     log('RECEIVER_READY gesendet', 'ok');
   } else {
-    log('Warte auf WebSocket, um RECEIVER_READY zu senden...', 'warn');
     setTimeout(sendReceiverReady, 200);
+  }
+}
+
+function appendChunk(data) {
+  if (!sourceBuffer || !mediaSource) return;
+  if (mediaSource.readyState !== 'open') return;
+  if (sourceBuffer.updating) {
+    setTimeout(function() { appendChunk(data); }, 10);
+    return;
+  }
+  try {
+    sourceBuffer.appendBuffer(data);
+
+    // Latenz-Optimierung: Wenn Buffer zu weit voraus ist, aufholen
+    if (videoEl.buffered.length > 0) {
+      var bufferedEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+      var currentTime = videoEl.currentTime;
+      var bufferAhead = bufferedEnd - currentTime;
+      if (bufferAhead > MAX_BUFFER_AHEAD) {
+        // Springe nach vorne, um Latenz abzubauen
+        videoEl.currentTime = bufferedEnd - 0.3;
+      }
+    }
+  } catch (e) {
+    log('appendBuffer: ' + erklärFehler(e), 'error');
   }
 }
 
@@ -146,16 +178,9 @@ function connect(code, asSender) {
     if (typeof event.data === 'string') {
       log('SERVER: ' + event.data);
 
-      if (event.data === 'ROOM_EMPTY') {
-        warnEl.textContent = 'Kein Sender in diesem Raum!';
-      }
-      if (event.data === 'SENDER_JOINED') {
-        warnEl.textContent = '';
-        log('Sender ist da!', 'ok');
-      }
-      if (event.data === 'SENDER_LEFT') {
-        warnEl.textContent = 'Sender hat den Raum verlassen!';
-      }
+      if (event.data === 'ROOM_EMPTY') warnEl.textContent = 'Kein Sender in diesem Raum!';
+      if (event.data === 'SENDER_JOINED') { warnEl.textContent = ''; log('Sender ist da!', 'ok'); }
+      if (event.data === 'SENDER_LEFT') warnEl.textContent = 'Sender hat den Raum verlassen!';
       if (event.data === 'RECEIVER_READY') {
         receiverReady = true;
         log('Empfänger bereit! Starte Stream.', 'ok');
@@ -171,29 +196,10 @@ function connect(code, asSender) {
       chunkCount++;
       bytesReceived += event.data.byteLength;
 
-      if (chunkCount === 1) {
-        log('Erster Chunk empfangen (' + event.data.byteLength + ' bytes)', 'ok');
-      } else if (chunkCount % 50 === 0) {
-        log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
-      }
+      if (chunkCount === 1) log('Erster Chunk empfangen (' + event.data.byteLength + ' bytes)', 'ok');
+      else if (chunkCount % 50 === 0) log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
 
-      if (sourceBuffer) {
-        if (sourceBuffer.updating) {
-          var waitForBuffer = setInterval(function() {
-            if (!sourceBuffer.updating) {
-              clearInterval(waitForBuffer);
-              try { sourceBuffer.appendBuffer(event.data); }
-              catch (e) { log('appendBuffer: ' + erklärFehler(e), 'error'); }
-            }
-          }, 10);
-        } else {
-          try {
-            sourceBuffer.appendBuffer(event.data);
-          } catch (e) {
-            log('appendBuffer: ' + erklärFehler(e), 'error');
-          }
-        }
-      }
+      appendChunk(event.data);
     }
   };
 
@@ -209,9 +215,37 @@ function setupReceiver() {
   mediaSource.addEventListener('sourceopen', function() {
     log('MediaSource OFFEN', 'ok');
     try {
-      sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs=vp8,opus');
+      // Codec-Priorität: H.264 zuerst (hardwarebeschleunigt, latenzärmer)
+      var codecs = [
+        'video/webm;codecs=h264,opus',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm'
+      ];
+      var chosen = null;
+      for (var i = 0; i < codecs.length; i++) {
+        if (MediaSource.isTypeSupported(codecs[i])) {
+          chosen = codecs[i];
+          break;
+        }
+      }
+      if (!chosen) { log('Kein Codec unterstützt!', 'error'); return; }
+
+      sourceBuffer = mediaSource.addSourceBuffer(chosen);
       sourceBuffer.mode = 'sequence';
-      log('SourceBuffer bereit', 'ok');
+      log('SourceBuffer bereit (' + chosen + ')', 'ok');
+
+      sourceBuffer.addEventListener('error', function() {
+        log('SourceBuffer ERROR - versuche neu aufzubauen', 'warn');
+        try {
+          if (mediaSource.readyState === 'open') {
+            mediaSource.removeSourceBuffer(sourceBuffer);
+            sourceBuffer = mediaSource.addSourceBuffer(chosen);
+            sourceBuffer.mode = 'sequence';
+            log('SourceBuffer neu aufgebaut', 'ok');
+          }
+        } catch (e) { log('Rebuild: ' + erklärFehler(e), 'error'); }
+      });
 
       sendReceiverReady();
     } catch (e) {
@@ -227,12 +261,12 @@ async function startStream(type) {
 
     if (type === 'screen') {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 },
+        video: { frameRate: { ideal: 30, max: 30 } },
         audio: true
       });
     } else {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { frameRate: 30, facingMode: 'environment' },
+        video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: true
       });
     }
@@ -241,16 +275,21 @@ async function startStream(type) {
     currentStream = stream;
     videoEl.srcObject = stream;
 
+    // Codec-Priorität auch beim Sender
     var mimeType = 'video/webm;codecs=vp8,opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) {
-      mimeType = 'video/webm';
-      log('vp8/opus nicht unterstützt, nutze video/webm', 'warn');
+    var candidates = ['video/webm;codecs=h264,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    for (var i = 0; i < candidates.length; i++) {
+      if (MediaRecorder.isTypeSupported(candidates[i])) {
+        mimeType = candidates[i];
+        break;
+      }
     }
+    log('MediaRecorder: ' + mimeType);
 
     mediaRecorder = new MediaRecorder(stream, {
       mimeType: mimeType,
-      videoBitsPerSecond: 1500000,
-      audioBitsPerSecond: 64000
+      videoBitsPerSecond: VIDEO_BITRATE,
+      audioBitsPerSecond: AUDIO_BITRATE
     });
 
     mediaRecorder.ondataavailable = function(event) {
@@ -259,7 +298,7 @@ async function startStream(type) {
         event.data.arrayBuffer().then(function(buf) {
           try {
             ws.send(buf);
-            if (chunkCount % 50 === 0) {
+            if (chunkCount % 100 === 0) {
               log('Gesendet: ' + chunkCount + ' | ' + (buf.byteLength/1024).toFixed(1) + ' KB');
             }
           } catch(e) {}
@@ -267,8 +306,9 @@ async function startStream(type) {
       }
     };
 
-    mediaRecorder.start(100);
-    log('Stream gestartet (' + type + ')', 'ok');
+    // Latenz-Optimierung: 30ms Chunks statt 100ms
+    mediaRecorder.start(CHUNK_INTERVAL_MS);
+    log('Stream gestartet (' + type + ') - Chunks alle ' + CHUNK_INTERVAL_MS + 'ms', 'ok');
     screenBtn.disabled = true;
     camBtn.disabled = true;
     stopBtn.disabled = false;
@@ -297,6 +337,7 @@ var myCode = generateCode();
 myCodeEl.textContent = myCode;
 log('Seite geladen. Code: ' + myCode);
 log('Bildschirm: ' + canScreen + ' | Kamera: ' + canCam);
+log('Chunk-Intervall: ' + CHUNK_INTERVAL_MS + 'ms | Video: ' + (VIDEO_BITRATE/1000) + 'kbps');
 
 screenBtn.addEventListener('click', function() {
   connect(myCode, true);
