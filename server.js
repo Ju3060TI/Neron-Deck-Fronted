@@ -1,6 +1,39 @@
 const WebSocket = require('ws');
 const http = require('http');
+const crypto = require('crypto');
 
+// ============================================================
+// KONFIGURATION
+// ============================================================
+const CONFIG = {
+  HEARTBEAT_INTERVAL: 15000,
+  ROOM_IDLE_TIMEOUT: 600000,
+  MAX_ROOM_SIZE: 2,
+  JOIN_RATE_LIMIT: 5,
+  JOIN_RATE_WINDOW: 60000,
+  CHUNK_INTERVAL_MS: 30,
+  VIDEO_BITRATE: 800000,
+  AUDIO_BITRATE: 48000,
+  BUFFER_HIGH: 1.5,
+  BUFFER_LOW: 0.4,
+  MAX_RECONNECT_ATTEMPTS: 3,
+  RECONNECT_BASE_DELAY: 1000
+};
+
+// ============================================================
+// LOGGING
+// ============================================================
+function log(level, msg) {
+  const time = new Date().toISOString();
+  console.log(`[${time}] [${level}] ${msg}`);
+}
+const logInfo  = (m) => log('INFO', m);
+const logWarn  = (m) => log('WARN', m);
+const logError = (m) => log('ERROR', m);
+
+// ============================================================
+// HTML
+// ============================================================
 const HTML = `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -47,425 +80,692 @@ input { background:#000; color:#00ffcc; border:2px solid #00ffcc; padding:8px; f
 <div class="log" id="log"></div>
 
 <script>
-var videoEl = document.getElementById('video');
-var statusEl = document.getElementById('status');
-var warnEl = document.getElementById('warnBox');
-var logEl = document.getElementById('log');
-var myCodeEl = document.getElementById('myCode');
-var joinCodeEl = document.getElementById('joinCode');
-var screenBtn = document.getElementById('screenBtn');
-var camBtn = document.getElementById('camBtn');
-var stopBtn = document.getElementById('stopBtn');
-var joinBtn = document.getElementById('joinBtn');
+(function() {
+  'use strict';
 
-var ws = null;
-var mediaRecorder = null;
-var mediaSource = null;
-var sourceBuffer = null;
-var currentStream = null;
-var isSender = false;
-var chunkCount = 0;
-var bytesReceived = 0;
-var pendingStreamType = null;
-var receiverReady = false;
-var firstRealChunkReceived = false;
-
-// Latenz-Optimierungen
-var CHUNK_INTERVAL_MS = 30;
-var VIDEO_BITRATE = 800000;
-var AUDIO_BITRATE = 48000;
-var MAX_BUFFER_AHEAD = 1.0;
-var MIN_CHUNK_SIZE = 100; // Chunks unter 100 Bytes ignorieren
-
-var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-
-var canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-var canCam = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-
-if (!canScreen) screenBtn.style.display = 'none';
-if (!canCam) camBtn.style.display = 'none';
-
-function erklärFehler(err) {
-  if (!err) return 'Unbekannter Fehler';
-  if (err.name === 'NotAllowedError') return 'Berechtigung verweigert.';
-  if (err.name === 'NotFoundError') return 'Kein Gerät gefunden.';
-  if (err.name === 'NotReadableError') return 'Gerät blockiert (andere App).';
-  if (err.name === 'NotSupportedError') return 'Nicht unterstützt.';
-  if (err.name === 'QuotaExceededError') return 'Buffer voll.';
-  if (err.name === 'InvalidStateError') return 'Buffer wurde entfernt.';
-  if (err.code === 1000) return 'Verbindung normal geschlossen.';
-  if (err.code === 1001) return 'Verbindung geschlossen (Tab zu).';
-  if (err.code === 1006) return 'Verbindung unerwartet abgebrochen.';
-  if (err.code === 1011) return 'Server-Fehler.';
-  return (err.name || 'Error') + ': ' + (err.message || String(err));
-}
-
-function log(msg, type) {
-  var cls = 'log-entry';
-  if (type === 'error') cls += ' log-error';
-  else if (type === 'warn') cls += ' log-warn';
-  else if (type === 'ok') cls += ' log-ok';
-  var time = new Date().toLocaleTimeString();
-  var entry = document.createElement('div');
-  entry.className = cls;
-  entry.textContent = '[' + time + '] ' + msg;
-  logEl.prepend(entry);
-  if (type === 'error') console.error(msg);
-  else if (type === 'warn') console.warn(msg);
-  else console.log(msg);
-}
-
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-function sendReceiverReady() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send('RECEIVER_READY');
-    log('RECEIVER_READY gesendet', 'ok');
-  } else {
-    setTimeout(sendReceiverReady, 200);
-  }
-}
-
-function appendChunk(data) {
-  if (!data || data.byteLength < MIN_CHUNK_SIZE) {
-    return; // Zu klein, kein echter Video-Chunk
-  }
-  if (!sourceBuffer || !mediaSource) return;
-  if (mediaSource.readyState !== 'open') return;
-  if (sourceBuffer.updating) {
-    setTimeout(function() { appendChunk(data); }, 10);
-    return;
-  }
-  try {
-    sourceBuffer.appendBuffer(data);
-
-    if (!firstRealChunkReceived) {
-      firstRealChunkReceived = true;
-      log('Erster ECHTER Chunk verarbeitet (' + data.byteLength + ' bytes)', 'ok');
-    }
-
-    // Latenz-Optimierung: Buffer aufholen
-    if (videoEl.buffered.length > 0) {
-      var bufferedEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
-      var bufferAhead = bufferedEnd - videoEl.currentTime;
-      if (bufferAhead > MAX_BUFFER_AHEAD) {
-        videoEl.currentTime = bufferedEnd - 0.3;
-      }
-    }
-  } catch (e) {
-    log('appendBuffer: ' + erklärFehler(e), 'error');
-  }
-}
-
-function connect(code, asSender) {
-  if (ws) { try { ws.close(); } catch(e) {} }
-
-  ws = new WebSocket(WS_URL);
-  ws.binaryType = 'arraybuffer';
-  isSender = asSender;
-  warnEl.textContent = '';
-  chunkCount = 0;
-  bytesReceived = 0;
-  receiverReady = false;
-  firstRealChunkReceived = false;
-
-  ws.onopen = function() {
-    log('WebSocket OFFEN', 'ok');
-    ws.send('JOIN:' + code + ':' + (asSender ? 'sender' : 'receiver'));
-    statusEl.textContent = 'Raum ' + code + ' verbunden';
-
-    if (!asSender && sourceBuffer) {
-      sendReceiverReady();
-    }
+  const CONFIG = {
+    CHUNK_INTERVAL_MS: 30,
+    VIDEO_BITRATE: 800000,
+    AUDIO_BITRATE: 48000,
+    BUFFER_HIGH: 1.5,
+    BUFFER_LOW: 0.4,
+    MAX_RECONNECT_ATTEMPTS: 3,
+    RECONNECT_BASE_DELAY: 1000
   };
 
-  ws.onmessage = function(event) {
-    if (typeof event.data === 'string') {
-      log('SERVER: ' + event.data);
+  // ---------- DOM ----------
+  const videoEl     = document.getElementById('video');
+  const statusEl    = document.getElementById('status');
+  const warnEl      = document.getElementById('warnBox');
+  const logEl       = document.getElementById('log');
+  const myCodeEl    = document.getElementById('myCode');
+  const joinCodeEl  = document.getElementById('joinCode');
+  const screenBtn   = document.getElementById('screenBtn');
+  const camBtn      = document.getElementById('camBtn');
+  const stopBtn     = document.getElementById('stopBtn');
+  const joinBtn     = document.getElementById('joinBtn');
 
-      if (event.data === 'ROOM_EMPTY') warnEl.textContent = 'Kein Sender in diesem Raum!';
-      if (event.data === 'SENDER_JOINED') { warnEl.textContent = ''; log('Sender ist da!', 'ok'); }
-      if (event.data === 'SENDER_LEFT') warnEl.textContent = 'Sender hat den Raum verlassen!';
-      if (event.data === 'RECEIVER_READY') {
-        receiverReady = true;
-        log('Empfänger bereit! Starte Stream.', 'ok');
-        if (pendingStreamType) {
-          startStream(pendingStreamType);
-          pendingStreamType = null;
-        }
-      }
+  // ---------- STATE ----------
+  let ws = null;
+  let mediaRecorder = null;
+  let mediaSource = null;
+  let sourceBuffer = null;
+  let currentStream = null;
+  let isSender = false;
+  let chunkCount = 0;
+  let bytesReceived = 0;
+  let receiverReady = false;
+  let firstRealChunkReceived = false;
+  let paused = false;
+  let reconnectAttempts = 0;
+  let lastRoomCode = null;
+  let lastRole = null;
+  let lastCallback = null;
+  let myCode = null;
+  let pendingType = null;
+  let streamRunning = false;
+
+  const myUserId = 'user-' + Math.floor(Math.random() * 10000);
+  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+
+  const canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  const canCam    = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  if (!canScreen) screenBtn.style.display = 'none';
+  if (!canCam)    camBtn.style.display = 'none';
+
+  // ---------- ERROR ----------
+  function explainError(err) {
+    if (!err) return 'Unbekannter Fehler';
+    if (err.name === 'NotAllowedError') return 'Berechtigung verweigert.';
+    if (err.name === 'NotFoundError') return 'Kein Gerät gefunden.';
+    if (err.name === 'NotReadableError') return 'Gerät blockiert (andere App).';
+    if (err.name === 'NotSupportedError') return 'Nicht unterstützt.';
+    if (err.name === 'QuotaExceededError') return 'Buffer voll.';
+    if (err.name === 'InvalidStateError') return 'Buffer wurde entfernt.';
+    if (err.code === 1000) return 'Verbindung normal geschlossen.';
+    if (err.code === 1001) return 'Verbindung geschlossen (Tab zu).';
+    if (err.code === 1006) return 'Verbindung unerwartet abgebrochen.';
+    if (err.code === 1011) return 'Server-Fehler.';
+    return (err.name || 'Error') + ': ' + (err.message || String(err));
+  }
+
+  // ---------- LOG ----------
+  function log(msg, type) {
+    let cls = 'log-entry';
+    if (type === 'error') cls += ' log-error';
+    else if (type === 'warn') cls += ' log-warn';
+    else if (type === 'ok') cls += ' log-ok';
+    const time = new Date().toLocaleTimeString();
+    const entry = document.createElement('div');
+    entry.className = cls;
+    entry.textContent = '[' + time + '] ' + msg;
+    logEl.prepend(entry);
+    if (type === 'error') console.error(msg);
+    else if (type === 'warn') console.warn(msg);
+    else console.log(msg);
+  }
+
+  // ---------- APPEND ----------
+  function appendChunk(data) {
+    if (!data || data.byteLength === 0) return;
+    if (!sourceBuffer || !mediaSource) return;
+    if (mediaSource.readyState !== 'open') return;
+    if (sourceBuffer.updating) {
+      setTimeout(() => appendChunk(data), 10);
       return;
     }
-
-    if (event.data instanceof ArrayBuffer && !isSender) {
-      chunkCount++;
-      bytesReceived += event.data.byteLength;
-
-      if (chunkCount % 50 === 0) {
-        log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
-      }
-
-      appendChunk(event.data);
-    }
-  };
-
-  ws.onerror = function(e) { log('WebSocket ERROR: ' + erklärFehler(e), 'error'); };
-  ws.onclose = function(e) { log('WebSocket GESCHLOSSEN: ' + erklärFehler(e), 'warn'); };
-}
-
-function setupReceiver() {
-  log('Richte Empfänger ein...');
-  mediaSource = new MediaSource();
-  videoEl.src = URL.createObjectURL(mediaSource);
-
-  mediaSource.addEventListener('sourceopen', function() {
-    log('MediaSource OFFEN', 'ok');
     try {
-      var codecs = [
-        'video/webm;codecs=h264,opus',
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
-        'video/webm'
-      ];
-      var chosen = null;
-      for (var i = 0; i < codecs.length; i++) {
-        if (MediaSource.isTypeSupported(codecs[i])) {
-          chosen = codecs[i];
-          break;
-        }
+      sourceBuffer.appendBuffer(data);
+      if (!firstRealChunkReceived) {
+        firstRealChunkReceived = true;
+        log('Erster ECHTER Chunk verarbeitet (' + data.byteLength + ' bytes)', 'ok');
       }
-      if (!chosen) { log('Kein Codec unterstützt!', 'error'); return; }
-
-      sourceBuffer = mediaSource.addSourceBuffer(chosen);
-      sourceBuffer.mode = 'sequence';
-      log('SourceBuffer bereit (' + chosen + ')', 'ok');
-
-      sourceBuffer.addEventListener('error', function() {
-        log('SourceBuffer ERROR - versuche neu aufzubauen', 'warn');
-        try {
-          if (mediaSource.readyState === 'open') {
-            mediaSource.removeSourceBuffer(sourceBuffer);
-            sourceBuffer = mediaSource.addSourceBuffer(chosen);
-            sourceBuffer.mode = 'sequence';
-            log('SourceBuffer neu aufgebaut', 'ok');
-          }
-        } catch (e) { log('Rebuild: ' + erklärFehler(e), 'error'); }
-      });
-
-      sendReceiverReady();
+      checkBufferLevel();
     } catch (e) {
-      log('addSourceBuffer: ' + erklärFehler(e), 'error');
+      log('appendBuffer: ' + explainError(e), 'error');
     }
-  });
-}
+  }
 
-async function startStream(type) {
-  try {
-    log('Starte Stream (' + type + ')...');
-    var stream;
+  // ---------- BACKPRESSURE ----------
+  function checkBufferLevel() {
+    if (isSender) return;
+    if (videoEl.buffered.length === 0) return;
+    const bufferedEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+    const bufferAhead = bufferedEnd - videoEl.currentTime;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    if (type === 'screen') {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 30 } },
-        audio: true
-      });
-    } else {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true
-      });
+    if (bufferAhead > CONFIG.BUFFER_HIGH && !paused) {
+      ws.send('BUFFER_HIGH');
+      paused = true;
+      log('Buffer HIGH (' + bufferAhead.toFixed(2) + 's) - Pause', 'warn');
+    } else if (bufferAhead < CONFIG.BUFFER_LOW && paused) {
+      ws.send('BUFFER_LOW');
+      paused = false;
+      log('Buffer LOW (' + bufferAhead.toFixed(2) + 's) - Resume', 'ok');
+    }
+  }
+
+  // ---------- CONNECT ----------
+  function connect(code, asSender, onOpenCallback) {
+    lastRoomCode = code;
+    lastRole = asSender;
+    lastCallback = onOpenCallback || null;
+
+    // FIX A: intentionalClose pro ws-Instanz statt global
+    if (ws) {
+      const oldWs = ws;
+      try {
+        oldWs._intentional = true;
+        oldWs.close();
+      } catch (e) {}
     }
 
-    log('Stream erhalten', 'ok');
-    currentStream = stream;
-    videoEl.srcObject = stream;
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = 'arraybuffer';
+    ws._intentional = false;
+    isSender = asSender;
+    warnEl.textContent = '';
+    chunkCount = 0;
+    bytesReceived = 0;
+    receiverReady = false;
+    firstRealChunkReceived = false;
+    paused = false;
 
-    var mimeType = 'video/webm;codecs=vp8,opus';
-    var candidates = ['video/webm;codecs=h264,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-    for (var i = 0; i < candidates.length; i++) {
-      if (MediaRecorder.isTypeSupported(candidates[i])) {
-        mimeType = candidates[i];
-        break;
+    ws.onopen = function() {
+      log('WebSocket OFFEN', 'ok');
+      reconnectAttempts = 0;
+      if (code) {
+        ws.send('JOIN:' + code + ':' + (asSender ? 'sender' : 'receiver') + ':' + myUserId);
+        statusEl.textContent = 'Raum ' + code + ' verbunden';
+        if (!asSender && sourceBuffer) sendReceiverReady();
       }
-    }
-    log('MediaRecorder: ' + mimeType);
+      if (onOpenCallback) onOpenCallback();
+    };
 
-    mediaRecorder = new MediaRecorder(stream, {
-      mimeType: mimeType,
-      videoBitsPerSecond: VIDEO_BITRATE,
-      audioBitsPerSecond: AUDIO_BITRATE
-    });
-
-    mediaRecorder.ondataavailable = function(event) {
-      if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN && isSender) {
-        // WICHTIG: Leere/kleine Chunks nicht senden
-        if (event.data.size < MIN_CHUNK_SIZE) return;
-        
+    ws.onmessage = function(event) {
+      if (typeof event.data === 'string') {
+        handleServerMessage(event.data);
+        return;
+      }
+      if (event.data instanceof ArrayBuffer && !isSender) {
         chunkCount++;
-        event.data.arrayBuffer().then(function(buf) {
-          try {
-            ws.send(buf);
-            if (chunkCount % 100 === 0) {
-              log('Gesendet: ' + chunkCount + ' | ' + (buf.byteLength/1024).toFixed(1) + ' KB');
-            }
-          } catch(e) {}
-        });
+        bytesReceived += event.data.byteLength;
+        if (chunkCount % 50 === 0) {
+          log('Chunks: ' + chunkCount + ' | ' + (bytesReceived/1024).toFixed(1) + ' KB');
+        }
+        appendChunk(event.data);
       }
     };
 
-    mediaRecorder.start(CHUNK_INTERVAL_MS);
-    log('Stream gestartet (' + type + ') - Chunks alle ' + CHUNK_INTERVAL_MS + 'ms', 'ok');
-    screenBtn.disabled = true;
-    camBtn.disabled = true;
-    stopBtn.disabled = false;
+    ws.onerror = function(e) {
+      log('WebSocket ERROR: ' + explainError(e), 'error');
+    };
 
-    stream.getVideoTracks()[0].onended = stopStream;
-  } catch (err) {
-    log('Stream: ' + erklärFehler(err), 'error');
+    ws.onclose = function(e) {
+      log('WebSocket GESCHLOSSEN: ' + explainError(e), 'warn');
+      // FIX A: pro-Instanz-Flag
+      if (ws._intentional) return;
+      if (reconnectAttempts < CONFIG.MAX_RECONNECT_ATTEMPTS && lastRoomCode) {
+        reconnectAttempts++;
+        const delay = CONFIG.RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts - 1);
+        log('Reconnect in ' + (delay/1000) + 's (' + reconnectAttempts + '/' + CONFIG.MAX_RECONNECT_ATTEMPTS + ')', 'warn');
+        setTimeout(function() {
+          connect(lastRoomCode, lastRole, lastCallback);
+        }, delay);
+      }
+    };
   }
-}
 
-function stopStream() {
-  try {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  } catch(e) {}
-  if (currentStream) {
-    currentStream.getTracks().forEach(function(t) { t.stop(); });
-    currentStream = null;
+  function sendReceiverReady() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('RECEIVER_READY');
+      log('RECEIVER_READY gesendet', 'ok');
+    }
   }
-  screenBtn.disabled = false;
-  camBtn.disabled = false;
-  stopBtn.disabled = true;
-  log('Stream gestoppt', 'warn');
-}
 
-var myCode = generateCode();
-myCodeEl.textContent = myCode;
-log('Seite geladen. Code: ' + myCode);
-log('Bildschirm: ' + canScreen + ' | Kamera: ' + canCam);
-log('Chunk: ' + CHUNK_INTERVAL_MS + 'ms | Video: ' + (VIDEO_BITRATE/1000) + 'kbps | Min-Chunk: ' + MIN_CHUNK_SIZE + ' Bytes');
+  // ---------- RESET SENDER UI ----------
+  // FIX B/C: Hilfsfunktion für konsistenten Reset
+  function resetSenderState() {
+    myCode = null;
+    myCodeEl.textContent = '------';
+    statusEl.textContent = 'Bereit';
+    receiverReady = false;
+  }
 
-screenBtn.addEventListener('click', function() {
-  connect(myCode, true);
-  pendingStreamType = 'screen';
-  var waitOpen = setInterval(function() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      clearInterval(waitOpen);
-      if (receiverReady) { startStream('screen'); pendingStreamType = null; }
-      else { log('Warte auf Empfänger...'); }
+  // ---------- SERVER-NACHRICHTEN ----------
+  function handleServerMessage(msg) {
+    log('SERVER: ' + msg);
+
+    if (msg === 'ROOM_EMPTY')   warnEl.textContent = 'Kein Sender in diesem Raum!';
+    if (msg === 'SENDER_JOINED'){ warnEl.textContent = ''; log('Sender ist da!', 'ok'); }
+    if (msg === 'SENDER_LEFT')   warnEl.textContent = 'Sender hat den Raum verlassen!';
+    if (msg === 'ERROR:no_code') warnEl.textContent = 'Server konnte keinen Code vergeben.';
+
+    // FIX C: RATE_LIMITED / ROOM_FULL im Sender-Kontext → Reset
+    if (msg === 'RATE_LIMITED') {
+      warnEl.textContent = 'Zu viele Versuche. Warte eine Minute.';
+      if (isSender) {
+        log('Sender-Reset wegen RATE_LIMITED', 'warn');
+        resetSenderState();
+      }
     }
-  }, 100);
-});
-
-camBtn.addEventListener('click', function() {
-  connect(myCode, true);
-  pendingStreamType = 'cam';
-  var waitOpen = setInterval(function() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      clearInterval(waitOpen);
-      if (receiverReady) { startStream('cam'); pendingStreamType = null; }
-      else { log('Warte auf Empfänger...'); }
+    if (msg === 'ROOM_FULL') {
+      warnEl.textContent = 'Raum ist voll (max. 2 Teilnehmer)!';
+      if (isSender) {
+        log('Sender-Reset wegen ROOM_FULL', 'warn');
+        resetSenderState();
+      }
     }
-  }, 100);
-});
 
-stopBtn.addEventListener('click', stopStream);
+    // Code vom Server erhalten → JETZT joinen
+    if (msg.startsWith('CODE:')) {
+      myCode = msg.substring(5);
+      myCodeEl.textContent = myCode;
+      log('Code vom Server: ' + myCode, 'ok');
+      statusEl.textContent = 'Warte auf Empfänger...';
+      if (ws && ws.readyState === WebSocket.OPEN && isSender) {
+        ws.send('JOIN:' + myCode + ':sender:' + myUserId);
+        lastRoomCode = myCode;
+        log('JOIN gesendet mit Code ' + myCode, 'ok');
+        if (receiverReady && pendingType && !streamRunning) {
+          startStream(pendingType);
+          pendingType = null;
+        }
+      }
+    }
 
-joinBtn.addEventListener('click', function() {
-  var code = joinCodeEl.value.trim();
-  if (!/^\\d{6}$/.test(code)) { alert('6-stelliger Code eingeben'); return; }
-  log('Verbinde als Empfänger mit Raum ' + code);
-  setupReceiver();
-  connect(code, false);
-});
+    if (msg === 'RECEIVER_READY') {
+      receiverReady = true;
+      log('Empfänger bereit!', 'ok');
+      if (isSender && pendingType && !streamRunning) {
+        startStream(pendingType);
+        pendingType = null;
+      }
+    }
+
+    if (msg === 'BUFFER_HIGH' && isSender && mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.pause();
+      log('Empfänger-Buffer voll - pausiere Sender', 'warn');
+    }
+    if (msg === 'BUFFER_LOW' && isSender && mediaRecorder && mediaRecorder.state === 'paused') {
+      mediaRecorder.resume();
+      log('Empfänger-Buffer leer - setze Sender fort', 'ok');
+    }
+  }
+
+  // ---------- CODE ANFORDERN ----------
+  function requestNewCode() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('REQUEST_CODE');
+      log('REQUEST_CODE gesendet', 'ok');
+    }
+  }
+
+  // ---------- EMPFÄNGER SETUP ----------
+  function setupReceiver() {
+    log('Richte Empfänger ein...');
+    if (mediaSource) {
+      try { URL.revokeObjectURL(videoEl.src); } catch (e) {}
+    }
+    mediaSource = new MediaSource();
+    videoEl.src = URL.createObjectURL(mediaSource);
+
+    mediaSource.addEventListener('sourceopen', function() {
+      log('MediaSource OFFEN', 'ok');
+      try {
+        const codecs = [
+          'video/webm;codecs=h264,opus',
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm'
+        ];
+        let chosen = null;
+        for (const c of codecs) {
+          if (MediaSource.isTypeSupported(c)) { chosen = c; break; }
+        }
+        if (!chosen) { log('Kein Codec unterstützt!', 'error'); return; }
+
+        sourceBuffer = mediaSource.addSourceBuffer(chosen);
+        sourceBuffer.mode = 'sequence';
+        sourceBuffer.timestampOffset = 0;
+        log('SourceBuffer bereit (' + chosen + ')', 'ok');
+
+        sourceBuffer.addEventListener('error', function() {
+          log('SourceBuffer ERROR - Rebuild', 'warn');
+          try {
+            if (mediaSource.readyState === 'open') {
+              mediaSource.removeSourceBuffer(sourceBuffer);
+              sourceBuffer = mediaSource.addSourceBuffer(chosen);
+              sourceBuffer.mode = 'sequence';
+              sourceBuffer.timestampOffset = 0;
+            }
+          } catch (e) { log('Rebuild: ' + explainError(e), 'error'); }
+        });
+
+        sendReceiverReady();
+      } catch (e) {
+        log('addSourceBuffer: ' + explainError(e), 'error');
+      }
+    });
+  }
+
+  // ---------- SENDER START ----------
+  async function startStream(type) {
+    if (streamRunning) { log('Stream läuft bereits', 'warn'); return; }
+    try {
+      log('Starte Stream (' + type + ')...');
+      let stream;
+
+      if (type === 'screen') {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: { ideal: 30, max: 30 } },
+          audio: true
+        });
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: true
+        });
+      }
+
+      log('Stream erhalten', 'ok');
+      currentStream = stream;
+      videoEl.srcObject = stream;
+      videoEl.muted = true;
+
+      let mimeType = 'video/webm;codecs=vp8,opus';
+      const candidates = ['video/webm;codecs=h264,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+      for (const c of candidates) {
+        if (MediaRecorder.isTypeSupported(c)) { mimeType = c; break; }
+      }
+      log('MediaRecorder: ' + mimeType);
+
+      mediaRecorder = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        videoBitsPerSecond: CONFIG.VIDEO_BITRATE,
+        audioBitsPerSecond: CONFIG.AUDIO_BITRATE
+      });
+
+      mediaRecorder.ondataavailable = function(event) {
+        if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN && isSender) {
+          chunkCount++;
+          event.data.arrayBuffer().then(function(buf) {
+            try {
+              ws.send(buf);
+              if (chunkCount % 100 === 0) {
+                log('Gesendet: ' + chunkCount + ' | ' + (buf.byteLength/1024).toFixed(1) + ' KB');
+              }
+            } catch (e) {}
+          });
+        }
+      };
+
+      mediaRecorder.start(CONFIG.CHUNK_INTERVAL_MS);
+      streamRunning = true;
+      log('Stream gestartet (' + type + ')', 'ok');
+      screenBtn.disabled = true;
+      camBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      stream.getVideoTracks()[0].onended = stopStream;
+    } catch (err) {
+      log('Stream: ' + explainError(err), 'error');
+      streamRunning = false;
+    }
+  }
+
+  // ---------- STOP ----------
+  function stopStream() {
+    try {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    } catch (e) {}
+    if (currentStream) {
+      currentStream.getTracks().forEach(function(t) { t.stop(); });
+      currentStream = null;
+    }
+    mediaRecorder = null;
+    streamRunning = false;
+    pendingType = null;
+
+    // FIX B: Sender-State komplett zurücksetzen
+    resetSenderState();
+
+    screenBtn.disabled = false;
+    camBtn.disabled = false;
+    stopBtn.disabled = true;
+    log('Stream gestoppt', 'warn');
+  }
+
+  // ---------- SENDER-FLOW ----------
+  function startSenderFlow(type) {
+    pendingType = type;
+    if (ws && ws.readyState === WebSocket.OPEN && myCode) {
+      ws.send('JOIN:' + myCode + ':sender:' + myUserId);
+      statusEl.textContent = 'Raum ' + myCode + ' verbunden';
+      if (receiverReady && !streamRunning) {
+        startStream(type);
+        pendingType = null;
+      }
+      return;
+    }
+    connect(null, true, function() {
+      requestNewCode();
+    });
+  }
+
+  // ---------- INIT ----------
+  log('Seite geladen. User: ' + myUserId);
+  log('Bildschirm: ' + canScreen + ' | Kamera: ' + canCam);
+
+  screenBtn.addEventListener('click', function() { startSenderFlow('screen'); });
+  camBtn.addEventListener('click',    function() { startSenderFlow('cam'); });
+  stopBtn.addEventListener('click',   stopStream);
+
+  joinBtn.addEventListener('click', function() {
+    const code = joinCodeEl.value.trim();
+    if (!/^\d{6}$/.test(code)) { alert('6-stelligen Code eingeben'); return; }
+    log('Verbinde als Empfänger mit Raum ' + code);
+    setupReceiver();
+    connect(code, false, null);
+  });
+})();
 </script>
 </body>
 </html>`;
 
+// ============================================================
+// HTTP-SERVER
+// ============================================================
 const server = http.createServer(function(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(HTML);
 });
 
+// ============================================================
+// WEBSOCKET-SERVER
+// ============================================================
 const wss = new WebSocket.Server({ server });
+
 const rooms = new Map();
+const rateLimits = new Map();
+
+// ============================================================
+// HILFSFUNKTIONEN
+// ============================================================
+function generateRoomCode() {
+  let attempts = 0;
+  while (attempts < 20) {
+    const code = String(crypto.randomInt(100000, 1000000));
+    if (!rooms.has(code)) return code;
+    attempts++;
+  }
+  logError('Konnte keinen freien Raum-Code generieren');
+  return null;
+}
 
 function getRoom(code) {
-  if (!rooms.has(code)) rooms.set(code, { senders: new Set(), receivers: new Set() });
+  if (!rooms.has(code)) {
+    rooms.set(code, {
+      senders: new Set(),
+      receivers: new Set(),
+      timer: null
+    });
+  }
   return rooms.get(code);
 }
 
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const entry = rateLimits.get(ip);
+  if (!entry || now > entry.resetTime) {
+    rateLimits.set(ip, { count: 1, resetTime: now + CONFIG.JOIN_RATE_WINDOW });
+    return true;
+  }
+  if (entry.count >= CONFIG.JOIN_RATE_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
+function resetRoomTimer(code) {
+  const room = rooms.get(code);
+  if (!room) return;
+  if (room.timer) clearTimeout(room.timer);
+  room.timer = setTimeout(function() {
+    logInfo('Raum ' + code + ' wegen Inaktivität gelöscht');
+    rooms.delete(code);
+  }, CONFIG.ROOM_IDLE_TIMEOUT);
+}
+
+function safeSend(ws, data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(data);
+    return true;
+  } catch (e) {
+    logWarn('ws.send() fehlgeschlagen: ' + e.message);
+    return false;
+  }
+}
+
+// ============================================================
+// VERBINDUNGEN
+// ============================================================
 wss.on('connection', function(ws, req) {
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   let roomCode = null;
   let role = null;
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log('[SERVER] Neue Verbindung von ' + clientIp);
+  let userId = null;
+  let isAlive = true;
+  let heartbeat = null;
+
+  logInfo('Neue Verbindung von ' + clientIp);
+
+  ws.on('pong', function() { isAlive = true; });
+
+  heartbeat = setInterval(function() {
+    if (!isAlive) {
+      logWarn('Client ' + userId + ' (' + clientIp + ') antwortet nicht - trenne');
+      clearInterval(heartbeat);
+      ws.terminate();
+      return;
+    }
+    isAlive = false;
+    try { ws.ping(); } catch (e) {}
+  }, CONFIG.HEARTBEAT_INTERVAL);
 
   ws.on('message', function(data) {
     const text = data.toString();
 
+    // --- REQUEST_CODE ---
+    if (text === 'REQUEST_CODE') {
+      const newCode = generateRoomCode();
+      if (!newCode) {
+        safeSend(ws, 'ERROR:no_code');
+        return;
+      }
+      getRoom(newCode);
+      safeSend(ws, 'CODE:' + newCode);
+      logInfo('Code ' + newCode + ' an ' + clientIp + ' vergeben');
+      return;
+    }
+
+    // --- JOIN ---
     if (text.startsWith('JOIN:')) {
       const parts = text.split(':');
-      roomCode = parts[1];
-      role = parts[2];
-      const room = getRoom(roomCode);
+      const joinCode = parts[1];
+      const joinRole = parts[2];
+      const joinUserId = parts[3] || 'unknown';
+
+      if (!/^\d{6}$/.test(joinCode)) {
+        safeSend(ws, 'RATE_LIMITED');
+        logWarn('Ungültiger Code von ' + clientIp + ': ' + joinCode);
+        return;
+      }
+
+      if (joinRole === 'receiver' && !rooms.has(joinCode)) {
+        safeSend(ws, 'ROOM_EMPTY');
+        logInfo('Empfänger ' + joinUserId + ' → nicht-existenter Raum ' + joinCode);
+        return;
+      }
+
+      if (!checkRateLimit(clientIp)) {
+        safeSend(ws, 'RATE_LIMITED');
+        logWarn('Rate-Limit für ' + clientIp);
+        return;
+      }
+
+      const targetRoom = getRoom(joinCode);
+
+      const totalClients = targetRoom.senders.size + targetRoom.receivers.size;
+      if (totalClients >= CONFIG.MAX_ROOM_SIZE) {
+        safeSend(ws, 'ROOM_FULL');
+        logWarn('Raum ' + joinCode + ' voll - ' + joinUserId + ' abgelehnt');
+        return;
+      }
+
+      roomCode = joinCode;
+      role = joinRole;
+      userId = joinUserId;
+      resetRoomTimer(roomCode);
+
+      logInfo('User: ' + userId + ' (' + role + ') → Raum ' + roomCode);
 
       if (role === 'sender') {
-        room.senders.add(ws);
-        console.log('[SERVER] Sender joined room ' + roomCode);
-        for (const r of room.receivers) {
-          if (r.readyState === WebSocket.OPEN) r.send('SENDER_JOINED');
+        targetRoom.senders.add(ws);
+        for (const r of targetRoom.receivers) {
+          safeSend(r, 'SENDER_JOINED');
         }
       } else {
-        room.receivers.add(ws);
-        console.log('[SERVER] Receiver joined room ' + roomCode);
-        if (room.senders.size === 0) ws.send('ROOM_EMPTY');
-        else ws.send('SENDER_JOINED');
+        targetRoom.receivers.add(ws);
+        if (targetRoom.senders.size === 0) safeSend(ws, 'ROOM_EMPTY');
+        else safeSend(ws, 'SENDER_JOINED');
       }
       return;
     }
 
+    // --- RECEIVER_READY ---
     if (text === 'RECEIVER_READY') {
       const room = rooms.get(roomCode);
       if (room) {
-        for (const s of room.senders) {
-          if (s.readyState === WebSocket.OPEN) s.send('RECEIVER_READY');
-        }
+        resetRoomTimer(roomCode);
+        for (const s of room.senders) safeSend(s, 'RECEIVER_READY');
       }
       return;
     }
 
+    // --- BACKPRESSURE ---
+    if (text === 'BUFFER_HIGH' || text === 'BUFFER_LOW') {
+      const room = rooms.get(roomCode);
+      if (room) {
+        for (const s of room.senders) safeSend(s, text);
+      }
+      return;
+    }
+
+    // --- BINÄR (Streaming) ---
     if (roomCode) {
       const room = rooms.get(roomCode);
       if (!room) return;
+      resetRoomTimer(roomCode);
       if (role === 'sender') {
         for (const r of room.receivers) {
-          if (r !== ws && r.readyState === WebSocket.OPEN) r.send(data);
+          if (r !== ws) safeSend(r, data);
         }
       }
     }
   });
 
   ws.on('close', function() {
-    console.log('[SERVER] Close: ' + clientIp + ' | Raum: ' + roomCode + ' | Rolle: ' + role);
+    if (heartbeat) clearInterval(heartbeat);
+    logInfo('User: ' + userId + ' hat Raum ' + roomCode + ' verlassen');
+
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     if (!room) return;
+
     if (role === 'sender') {
       room.senders.delete(ws);
-      for (const r of room.receivers) {
-        if (r.readyState === WebSocket.OPEN) r.send('SENDER_LEFT');
-      }
+      for (const r of room.receivers) safeSend(r, 'SENDER_LEFT');
     } else {
       room.receivers.delete(ws);
     }
-    if (room.senders.size === 0 && room.receivers.size === 0) rooms.delete(roomCode);
+
+    if (room.senders.size === 0 && room.receivers.size === 0) {
+      if (room.timer) clearTimeout(room.timer);
+      rooms.delete(roomCode);
+      logInfo('Raum ' + roomCode + ' gelöscht (leer)');
+    }
+  });
+
+  ws.on('error', function(err) {
+    logError('WebSocket-Fehler: ' + err.message);
   });
 });
 
+// ============================================================
+// SERVER START
+// ============================================================
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, function() {
-  console.log('[SERVER] NERON DECK Relay läuft auf Port ' + PORT);
+  logInfo('NERON DECK Relay läuft auf Port ' + PORT);
 });
